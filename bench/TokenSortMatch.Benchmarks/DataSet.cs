@@ -7,7 +7,18 @@ using TokenSortMatch;
 /// </summary>
 static class DataSet
 {
-	public const string Dir = "bench/data";
+	/// <summary>Repo-rooted data dir, found by walking up from cwd/assembly (BenchmarkDotNet
+	/// child processes run from their own artifact directories).</summary>
+	public static readonly string Dir = FindDataDir();
+
+	static string FindDataDir()
+	{
+		foreach (var start in new[] { Environment.CurrentDirectory, AppContext.BaseDirectory })
+			for (var dir = new DirectoryInfo(start); dir is not null; dir = dir.Parent)
+				if (Directory.Exists(Path.Combine(dir.FullName, "bench")))
+					return Path.Combine(dir.FullName, "bench", "data");
+		throw new DirectoryNotFoundException("Could not locate the repo's bench/ directory.");
+	}
 
 	static readonly string[] Stems =
 	[
@@ -55,7 +66,7 @@ static class DataSet
 		var path = Path.Combine(Dir, name);
 		if (!File.Exists(path))
 			throw new FileNotFoundException(
-				$"'{path}' not found. Run from the repo root, and generate data first with " +
+				$"'{path}' not found. Generate data first with " +
 				"'dotnet run --project bench/TokenSortMatch.Benchmarks -c Release -- dump'.");
 		return File.ReadAllLines(path);
 	}

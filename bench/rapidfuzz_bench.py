@@ -56,9 +56,11 @@ def bench(label: str, items: list[str], queries: list[str], expected: np.ndarray
     print(f"score verification vs TokenSortMatch: {status} ({len(expected)} queries)")
 
     for cutoff in (80, None):
+        # Sustained steady-state timing over a fixed budget (mirrors the .NET side).
         cdist(queries, items, cutoff=cutoff)  # warmup
         best_s = float("inf")
-        for _ in range(5):
+        t_end = time.perf_counter() + 3.0
+        while time.perf_counter() < t_end:
             t0 = time.perf_counter()
             cdist(queries, items, cutoff=cutoff)
             best_s = min(best_s, time.perf_counter() - t0)

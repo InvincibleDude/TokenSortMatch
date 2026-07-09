@@ -50,15 +50,18 @@ static class QuickBench
 
 	static void Time<T>(string label, Func<T> run, double pairs)
 	{
+		// Sustained steady-state timing: loop for a fixed budget so tiered JIT,
+		// thread-pool wake-up and CPU frequency all settle (mirrors the Python side).
 		run(); // warmup (JIT + buffers)
 		var bestMs = double.MaxValue;
-		for (var r = 0; r < 5; r++)
+		var budget = Stopwatch.StartNew();
+		do
 		{
 			var sw = Stopwatch.StartNew();
 			run();
 			sw.Stop();
 			bestMs = Math.Min(bestMs, sw.Elapsed.TotalMilliseconds);
-		}
+		} while (budget.ElapsedMilliseconds < 3000);
 		Console.WriteLine($"{label,-45} {bestMs,9:F1} ms {pairs / bestMs / 1000,10:F2} Mpairs/s");
 	}
 }

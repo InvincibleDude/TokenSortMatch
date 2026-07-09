@@ -125,6 +125,34 @@ public class TokenSortIndexTests
 	}
 
 	[Fact]
+	public void Lane_bucket_boundaries_score_exactly()
+	{
+		// Normalized lengths straddle every lane-bucket boundary (16/32/64 bits) plus
+		// the multi-block threshold. Items are single tokens so normalization keeps
+		// their length; distinct suffix letters prevent accidental full matches.
+		int[] lengths = [1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 130];
+		var items = lengths
+			.Select((len, i) => new string((char)('a' + i), len))
+			.Concat(lengths.Select(len => string.Concat(
+				Enumerable.Range(0, len).Select(j => (char)('a' + j % 7)))))
+			.ToArray();
+		var index = new TokenSortIndex(items);
+
+		var queries = items
+			.Concat(new[] { 1, 8, 16, 17, 32, 33, 64, 65, 100 }.Select(len => new string('a', len)))
+			.Concat(["abcdefg", "gfedcba abc", "zzz"])
+			.ToArray();
+		foreach (var q in queries)
+		{
+			var expected = items.Max(it => TokenSort.Ratio(q, it));
+			var match = index.FindBest(q, 0);
+			Assert.NotNull(match);
+			Assert.Equal(expected, match.Value.Score);
+			Assert.Equal(expected, TokenSort.Ratio(q, items[match.Value.ItemIndex]));
+		}
+	}
+
+	[Fact]
 	public void Item_count_not_divisible_by_lane_width_works()
 	{
 		for (var n = 1; n <= 9; n++)

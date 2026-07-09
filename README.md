@@ -4,11 +4,13 @@ Fast token-sort fuzzy best-matching for .NET. Zero dependencies.
 
 Scores are **bit-identical** to `Fuzz.Ratio(normalize(a), normalize(b))` from
 RapidFuzz/FuzzySharp (token-sort ratio with full preprocessing) — verified by a
-randomized oracle test suite — but batch matching runs **~100× faster** than calling the
-library per pair, via:
+randomized oracle test suite — while batch matching runs **~7-9× faster than
+RapidFuzz's native `cdist`** on short items (parity on long ones) and ~1 000× faster
+than per-pair FuzzySharp, under plain AVX2 ([benchmarks](bench/README.md)), via:
 
-- transposed pattern bitmasks + bit-parallel LCS (Hyyrö/Myers), 4 items per
-  `Vector256<ulong>` pass (auto opt-in; scalar fallback for CPUs without 256-bit SIMD),
+- transposed pattern bitmasks + bit-parallel LCS (Hyyrö/Myers) in length-bucketed
+  16/32/64-bit lanes — 16, 8 or 4 items per `Vector256` pass (auto opt-in; scalar
+  fallback for CPUs without 256-bit SIMD),
 - allocation-free query normalization (char-map table, in-place token sort),
 - exactly-rounded score upper bounds pruning item groups against the running best,
 - multi-block path for items whose normalized form exceeds 64 chars.
