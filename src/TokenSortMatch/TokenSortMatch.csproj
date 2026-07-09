@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>
+    <LangVersion>12</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <PackageId>TokenSortMatch</PackageId>
+    <Version>0.1.0</Version>
+    <Description>Fast token-sort fuzzy best-match. SIMD bit-parallel LCS (Hyyrö/Myers) with exact RapidFuzz/FuzzySharp token-sort-ratio semantics and zero per-pair allocations. No dependencies.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageTags>fuzzy-matching;levenshtein;indel;token-sort;simd;rapidfuzz;fuzzysharp</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/InvincibleDude/TokenSortMatch</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/InvincibleDude/TokenSortMatch</PackageProjectUrl>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+    <None Include="../../LICENSE" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+</Project>
