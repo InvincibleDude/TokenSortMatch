@@ -46,26 +46,28 @@ two libraries.
 
 | workload | scorer | best time | Mpairs/s |
 |---|---|---:|---:|
-| short (2M pairs) | **TokenSortMatch** cutoff=80 | **0.9 ms** | **2 288** |
-| short (2M pairs) | **TokenSortMatch** no cutoff | **1.1 ms** | **1 774** |
+| short (2M pairs) | **TokenSortMatch** cutoff=80 | **0.8 ms** | **2 405** |
+| short (2M pairs) | **TokenSortMatch** no cutoff | **1.2 ms** | **1 706** |
 | short (2M pairs) | RapidFuzz `cdist` cutoff=80 | 7.8 ms | 258 |
 | short (2M pairs) | RapidFuzz `cdist` no cutoff | 7.7 ms | 258 |
-| short (100k pairs) | FuzzySharp per-pair (parallel) | 51.8 ms | 1.9 |
-| long (100k pairs) | **TokenSortMatch** cutoff=80 | 56.4 ms | 1.77 |
+| short (100k pairs) | FuzzySharp per-pair (parallel) | 50.6 ms | 2.0 |
+| long (100k pairs) | **TokenSortMatch** cutoff=80 | **8.9 ms** | **11.2** |
+| long (100k pairs) | **TokenSortMatch** no cutoff | **8.7 ms** | **11.4** |
 | long (100k pairs) | RapidFuzz `cdist` cutoff=80 | 58.0 ms | 1.72 |
-| long (50k pairs) | FuzzySharp per-pair (parallel) | 223 ms | 0.22 |
+| long (50k pairs) | FuzzySharp per-pair (parallel) | 210 ms | 0.24 |
 
 BenchmarkDotNet cross-check (means): short cutoff=80 1.50 ms ± 0.05, cutoff=0
-1.70 ms ± 0.01, long ~62 ms; zero Gen0 collections, ~45 KB allocated per 10k-query
-batch (the result array).
+1.70 ms ± 0.01; zero Gen0 collections, ~45 KB allocated per 10k-query batch (the
+result array).
 
-Summary: on short items TokenSortMatch is **~7-9× faster** than RapidFuzz's C++
-SIMD batch API under identical ISA conditions (AVX2), driven by 16/32-bit lane
-packing (16/8 items per Vector256 pass), transposed bitmasks precomputed at index
-construction, exactly-rounded group pruning and static-chunk parallelism. On long
-multi-block items the two are within a few percent. Both are far ahead of per-pair
-FuzzySharp (~1 200× / ~8×). TokenSortMatch is measured through its public .NET API;
-RapidFuzz through its native batch API from Python — calling RapidFuzz *from .NET*
-would add interop + UTF-16 marshalling costs not shown here. RapidFuzz re-derives
-pattern bitmasks per `cdist` call, while `TokenSortIndex` amortizes them across
-calls — that amortization is the point of the index API.
+Summary: under identical ISA conditions (AVX2) TokenSortMatch is **~7-9× faster**
+than RapidFuzz's C++ SIMD batch API on short items and **~6.5× faster** on long
+multi-block items, driven by 16/32-bit lane packing (16/8 items per Vector256
+pass), a 4-lane vectorized multi-block path with per-lane carry/borrow chains,
+transposed bitmasks precomputed at index construction, exactly-rounded group
+pruning and static-chunk parallelism. Both are far ahead of per-pair FuzzySharp.
+TokenSortMatch is measured through its public .NET API; RapidFuzz through its
+native batch API from Python — calling RapidFuzz *from .NET* would add interop +
+UTF-16 marshalling costs not shown here. RapidFuzz re-derives pattern bitmasks per
+`cdist` call, while `TokenSortIndex` amortizes them across calls — that
+amortization is the point of the index API.

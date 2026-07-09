@@ -32,8 +32,11 @@ public sealed class TokenSortIndex
 	readonly Bucket<ushort> _b16;    // normalized length 1..16, 16 lanes per pass
 	readonly Bucket<uint> _b32;      // 17..32, 8 lanes per pass
 	readonly Bucket<ulong> _b64;     // 33..64 (or 1..64 without SIMD), 4 lanes
-	readonly LongItem[] _longItems;  // normalized length > 64
+	readonly LongItem[] _longItems;  // normalized length > 64, scalar fallback path
+	readonly LongGroup[] _longGroups; // normalized length > 64, 4 ulong lanes per pass
 	readonly int _maxBlocks;
+
+	const int LongLanes = 4; // Vector256<ulong>.Count
 
 	/// <summary>
 	/// A length bucket: lane-transposed bitmasks for items whose LCS state fits the
@@ -58,6 +61,23 @@ public sealed class TokenSortIndex
 		public required int Blocks;
 		public required ulong[] Peq; // [code * Blocks + block]
 		public required ulong LastMask;
+	}
+
+	/// <summary>
+	/// Four long items scored per pass in <see cref="Vector256{T}"/> ulong lanes, with
+	/// the multi-block carry/borrow chains carried per lane. Lanes past a lane's real
+	/// block count stay all-ones pads (their bitmask rows are zero and block carries
+	/// only propagate upward), so short lanes coexist with the group's longest item.
+	/// </summary>
+	sealed class LongGroup
+	{
+		public required int Blocks;         // max blocks across lanes
+		public required ulong[] PeqT;       // [(code * Blocks + block) * 4 + lane]
+		public required ulong[] InitState;  // [block * 4 + lane]
+		public required int[] Lengths;      // per lane; 0 = pad lane
+		public required int[] OriginalIndex;
+		public required int MinLen;
+		public required int MaxLen;
 	}
 
 	/// <summary>Number of items in the index.</summary>
@@ -110,23 +130,65 @@ public sealed class TokenSortIndex
 		_b32 = BuildBucket<uint>(e16, e32, alpha);
 		_b64 = BuildBucket<ulong>(e32, bpEnd, alpha);
 
-		_longItems = new LongItem[n - bpEnd];
-		for (var t = bpEnd; t < n; t++)
+		if (Vector256.IsHardwareAccelerated)
 		{
-			var s = _itemsNorm[t];
-			var blocks = (s.Length + 63) >> 6;
-			var peq = new ulong[alpha * blocks];
-			for (var j = 0; j < s.Length; j++)
-				peq[_charIdx[s[j]] * blocks + (j >> 6)] |= 1UL << (j & 63);
-			_longItems[t - bpEnd] = new LongItem
+			// Long items in groups of 4 ulong lanes, vectorized carry/borrow chains.
+			_longItems = [];
+			_longGroups = new LongGroup[(n - bpEnd + LongLanes - 1) / LongLanes];
+			for (var g = 0; g < _longGroups.Length; g++)
 			{
-				OriginalIndex = order[t],
-				Length = s.Length,
-				Blocks = blocks,
-				Peq = peq,
-				LastMask = TokenSort.LastBlockMask(s.Length),
-			};
-			_maxBlocks = Math.Max(_maxBlocks, blocks);
+				var start = bpEnd + g * LongLanes;
+				var laneCount = Math.Min(LongLanes, n - start);
+				// Items are length-sorted, so the last lane has the group's max blocks.
+				var blocks = (_itemsNorm[start + laneCount - 1].Length + 63) >> 6;
+				var grp = new LongGroup
+				{
+					Blocks = blocks,
+					PeqT = new ulong[alpha * blocks * LongLanes],
+					InitState = new ulong[blocks * LongLanes],
+					Lengths = new int[LongLanes],
+					OriginalIndex = new int[LongLanes],
+					MinLen = _itemsNorm[start].Length,
+					MaxLen = _itemsNorm[start + laneCount - 1].Length,
+				};
+				grp.InitState.AsSpan().Fill(ulong.MaxValue);
+				for (var lane = 0; lane < laneCount; lane++)
+				{
+					var s = _itemsNorm[start + lane];
+					grp.Lengths[lane] = s.Length;
+					grp.OriginalIndex[lane] = order[start + lane];
+					// Pad blocks past a lane's last stay all-ones: their peq rows are zero
+					// and upward carries never feed back into real blocks.
+					grp.InitState[(((s.Length + 63) >> 6) - 1) * LongLanes + lane] =
+						TokenSort.LastBlockMask(s.Length);
+					for (var j = 0; j < s.Length; j++)
+						grp.PeqT[(_charIdx[s[j]] * blocks + (j >> 6)) * LongLanes + lane] |= 1UL << (j & 63);
+				}
+				_longGroups[g] = grp;
+				_maxBlocks = Math.Max(_maxBlocks, blocks);
+			}
+		}
+		else
+		{
+			_longGroups = [];
+			_longItems = new LongItem[n - bpEnd];
+			for (var t = bpEnd; t < n; t++)
+			{
+				var s = _itemsNorm[t];
+				var blocks = (s.Length + 63) >> 6;
+				var peq = new ulong[alpha * blocks];
+				for (var j = 0; j < s.Length; j++)
+					peq[_charIdx[s[j]] * blocks + (j >> 6)] |= 1UL << (j & 63);
+				_longItems[t - bpEnd] = new LongItem
+				{
+					OriginalIndex = order[t],
+					Length = s.Length,
+					Blocks = blocks,
+					Peq = peq,
+					LastMask = TokenSort.LastBlockMask(s.Length),
+				};
+				_maxBlocks = Math.Max(_maxBlocks, blocks);
+			}
 		}
 	}
 
@@ -274,8 +336,14 @@ public sealed class TokenSortIndex
 
 			if (!done)
 			{
+				foreach (var grp in _longGroups)
+				{
+					ScanLongGroup(grp, worker, l1, ref b, ref bestIdx, ref done);
+					if (done) break;
+				}
 				foreach (var item in _longItems)
 				{
+					if (done) break;
 					if (TokenSort.UpperBoundScore(l1, item.Length) <= b) continue;
 					var lcs = LcsLong(item, worker, l1);
 					var score = TokenSort.ScoreFromLcs(l1, item.Length, lcs);
@@ -412,6 +480,65 @@ public sealed class TokenSortIndex
 			}
 		}
 		return TokenSort.CountZeroBits(s, item.LastMask);
+	}
+
+	/// <summary>
+	/// Multi-block LCS over four long items at once: the scalar carry/borrow chains of
+	/// <see cref="LcsLong"/> run per ulong lane. Carry-out of <c>sk + u + carry</c> is
+	/// the classic full-adder MSB <c>(a&amp;b | (a|b)&amp;~sum) &gt;&gt; 63</c>; the
+	/// subtraction never borrows from <c>sk - u</c> itself (u ⊆ sk bitwise), only from
+	/// the injected borrow bit, so borrow-out is <c>(sk - u == 0) &amp; borrow</c>.
+	/// </summary>
+	void ScanLongGroup(LongGroup grp, Worker worker, int l1, ref int b, ref int bestIdx, ref bool done)
+	{
+		var l2c = Math.Clamp(l1, grp.MinLen, grp.MaxLen);
+		if (TokenSort.UpperBoundScore(l1, l2c) <= b) return;
+
+		var blocks = grp.Blocks;
+		var state = worker.Blocks(_maxBlocks * LongLanes).AsSpan(0, blocks * LongLanes);
+		grp.InitState.AsSpan().CopyTo(state);
+		ref var state0 = ref MemoryMarshal.GetReference(state);
+		ref var peq0 = ref MemoryMarshal.GetArrayDataReference(grp.PeqT);
+		var codes = worker.Codes;
+		var rowStride = blocks * LongLanes;
+
+		for (var j = 0; j < l1; j++)
+		{
+			ref var row = ref Unsafe.Add(ref peq0, codes[j] * rowStride);
+			var carry = Vector256<ulong>.Zero;
+			var borrow = Vector256<ulong>.Zero;
+			for (var k = 0; k < rowStride; k += LongLanes)
+			{
+				var sk = Vector256.LoadUnsafe(ref Unsafe.Add(ref state0, k));
+				var u = sk & Vector256.LoadUnsafe(ref Unsafe.Add(ref row, k));
+				var sum = sk + u + carry;
+				carry = ((sk & u) | ((sk | u) & ~sum)) >>> 63;
+				var t1 = sk - u;
+				var diff = t1 - borrow;
+				borrow = Vector256.Equals(t1, Vector256<ulong>.Zero) & borrow;
+				(sum | diff).StoreUnsafe(ref Unsafe.Add(ref state0, k));
+			}
+		}
+
+		for (var lane = 0; lane < LongLanes; lane++)
+		{
+			var l2 = grp.Lengths[lane];
+			if (l2 == 0) continue;
+			if (TokenSort.UpperBoundScore(l1, l2) <= b) continue;
+			var laneBlocks = (l2 + 63) >> 6;
+			var zeros = 0;
+			for (var k = 0; k < laneBlocks - 1; k++)
+				zeros += BitOperations.PopCount(~state[k * LongLanes + lane]);
+			zeros += BitOperations.PopCount(
+				~state[(laneBlocks - 1) * LongLanes + lane] & TokenSort.LastBlockMask(l2));
+			var score = TokenSort.ScoreFromLcs(l1, l2, zeros);
+			if (score > b)
+			{
+				b = score;
+				bestIdx = grp.OriginalIndex[lane];
+				if (b == 100) { done = true; return; }
+			}
+		}
 	}
 
 	[ThreadStatic] static Worker? _worker;
