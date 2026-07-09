@@ -5,4 +5,7 @@
   <Folder Name="/tests/">
     <Project Path="tests/TokenSortMatch.Tests/TokenSortMatch.Tests.csproj" />
   </Folder>
+  <Folder Name="/bench/">
+    <Project Path="bench/TokenSortMatch.Benchmarks/TokenSortMatch.Benchmarks.csproj" />
+  </Folder>
 </Solution>
