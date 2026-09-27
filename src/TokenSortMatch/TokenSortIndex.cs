@@ -15,12 +15,14 @@ public readonly record struct BestMatch(int ItemIndex, int Score);
 /// Scores are exactly <see cref="TokenSort.Ratio"/> — no approximation is ever traded
 /// for speed. Construction normalizes the items, sorts them by normalized length and
 /// packs them into length buckets of transposed pattern bitmasks: items whose
-/// normalized form fits 16/32/64 bits run a bit-parallel LCS (Hyyrö/Myers) in
+/// normalized form fits 16/32/64 bits run a bit-parallel LCS (Hyyrö 2004) in
 /// 16/32/64-bit SIMD lanes — 16, 8 or 4 items per <see cref="Vector256{T}"/> pass —
 /// when the hardware accelerates it (an equivalent scalar path is used otherwise).
+/// Items whose normalized form exceeds 64 chars run a multi-block LCS, four items per
+/// pass in <see cref="Vector256{T}"/> ulong lanes (one item at a time without SIMD).
 /// Groups of items are pruned with an exactly-rounded score upper bound against the
-/// running best. Items whose normalized form exceeds 64 chars use a multi-block
-/// scalar path.
+/// running best. Each bitmask table only has rows for the characters of its own items,
+/// so memory follows the item text instead of (distinct characters) × (item count).
 ///
 /// Instances are immutable and safe for concurrent use.
 /// </summary>
@@ -28,7 +30,7 @@ public sealed class TokenSortIndex
 {
 	readonly string[] _itemsNorm;    // normalized items, sorted by normalized length
 	readonly int[] _sortedToOriginal;
-	readonly ushort[] _charIdx;      // char -> alphabet code; 0 = absent (zero mask)
+	readonly ushort[] _charIdx;      // char -> global alphabet code; 0 = in no item
 	readonly Bucket<ushort> _b16;    // normalized length 1..16, 16 lanes per pass
 	readonly Bucket<uint> _b32;      // 17..32, 8 lanes per pass
 	readonly Bucket<ulong> _b64;     // 33..64 (or 1..64 without SIMD), 4 lanes
@@ -39,19 +41,41 @@ public sealed class TokenSortIndex
 	const int LongLanes = 4; // Vector256<ulong>.Count
 
 	/// <summary>
+	/// Maximum rows × columns of one bucket segment table. A segment stops growing before
+	/// it would pass this size. One lane group alone needs at most 257 × 16 cells, so it
+	/// always fits. Small alphabets get a few thousand items per segment; alphabets with
+	/// thousands of characters get many small segments instead of one huge table.
+	/// </summary>
+	const int SegmentCells = 1 << 16;
+
+	/// <summary>
 	/// A length bucket: lane-transposed bitmasks for items whose LCS state fits the
 	/// lane type <typeparamref name="T"/>. Column layout is padded to whole
 	/// <see cref="Vector256{T}"/> groups; zero-length pad lanes never score.
 	/// </summary>
 	sealed class Bucket<T> where T : unmanaged
 	{
-		public required T[] PeqT;         // transposed bitmasks: [code * Width + col]
+		public required Segment<T>[] Segments; // consecutive column ranges, in column order
 		public required T[] LenMaskCol;   // per-lane initial state == length mask
 		public required int[] ItemLenCol;
 		public required int[] GroupMinLen;
 		public required int[] GroupMaxLen;
 		public required int SortedBase;   // first sorted-order index in this bucket
-		public int Width => ItemLenCol.Length;
+	}
+
+	/// <summary>
+	/// Bucket columns [Col0, Col0 + Width) sharing one transposed bitmask table. Its rows
+	/// are local character codes: <see cref="LocalCode"/> maps a global code to a row, and
+	/// row 0 is all zeros for every character that no item in the segment contains.
+	/// </summary>
+	sealed class Segment<T> where T : unmanaged
+	{
+		public required int Col0;           // first bucket column; a multiple of the lane count
+		public required int Width;          // column count; a multiple of the lane count
+		public required int MinLen;         // shortest and longest item (items are length-sorted)
+		public required int MaxLen;
+		public required ushort[] LocalCode; // global code -> row
+		public required T[] PeqT;           // [row * Width + (col - Col0)]
 	}
 
 	sealed class LongItem
@@ -59,7 +83,8 @@ public sealed class TokenSortIndex
 		public required int OriginalIndex;
 		public required int Length;
 		public required int Blocks;
-		public required ulong[] Peq; // [code * Blocks + block]
+		public required ushort[] LocalCode; // global code -> row; row 0 is all zeros
+		public required ulong[] Peq;        // [row * Blocks + block]
 		public required ulong LastMask;
 	}
 
@@ -72,7 +97,8 @@ public sealed class TokenSortIndex
 	sealed class LongGroup
 	{
 		public required int Blocks;         // max blocks across lanes
-		public required ulong[] PeqT;       // [(code * Blocks + block) * 4 + lane]
+		public required ushort[] LocalCode; // global code -> row; row 0 is all zeros
+		public required ulong[] PeqT;       // [(row * Blocks + block) * 4 + lane]
 		public required ulong[] InitState;  // [block * 4 + lane]
 		public required int[] Lengths;      // per lane; 0 = pad lane
 		public required int[] OriginalIndex;
@@ -141,10 +167,12 @@ public sealed class TokenSortIndex
 				var laneCount = Math.Min(LongLanes, n - start);
 				// Items are length-sorted, so the last lane has the group's max blocks.
 				var blocks = (_itemsNorm[start + laneCount - 1].Length + 63) >> 6;
+				var (localCode, rows) = LocalAlphabet(start, start + laneCount, alpha);
 				var grp = new LongGroup
 				{
 					Blocks = blocks,
-					PeqT = new ulong[alpha * blocks * LongLanes],
+					LocalCode = localCode,
+					PeqT = new ulong[checked(rows * blocks * LongLanes)],
 					InitState = new ulong[blocks * LongLanes],
 					Lengths = new int[LongLanes],
 					OriginalIndex = new int[LongLanes],
@@ -162,7 +190,7 @@ public sealed class TokenSortIndex
 					grp.InitState[(((s.Length + 63) >> 6) - 1) * LongLanes + lane] =
 						TokenSort.LastBlockMask(s.Length);
 					for (var j = 0; j < s.Length; j++)
-						grp.PeqT[(_charIdx[s[j]] * blocks + (j >> 6)) * LongLanes + lane] |= 1UL << (j & 63);
+						grp.PeqT[(localCode[_charIdx[s[j]]] * blocks + (j >> 6)) * LongLanes + lane] |= 1UL << (j & 63);
 				}
 				_longGroups[g] = grp;
 				_maxBlocks = Math.Max(_maxBlocks, blocks);
@@ -176,14 +204,16 @@ public sealed class TokenSortIndex
 			{
 				var s = _itemsNorm[t];
 				var blocks = (s.Length + 63) >> 6;
-				var peq = new ulong[alpha * blocks];
+				var (localCode, rows) = LocalAlphabet(t, t + 1, alpha);
+				var peq = new ulong[checked(rows * blocks)];
 				for (var j = 0; j < s.Length; j++)
-					peq[_charIdx[s[j]] * blocks + (j >> 6)] |= 1UL << (j & 63);
+					peq[localCode[_charIdx[s[j]]] * blocks + (j >> 6)] |= 1UL << (j & 63);
 				_longItems[t - bpEnd] = new LongItem
 				{
 					OriginalIndex = order[t],
 					Length = s.Length,
 					Blocks = blocks,
+					LocalCode = localCode,
 					Peq = peq,
 					LastMask = TokenSort.LastBlockMask(s.Length),
 				};
@@ -196,34 +226,124 @@ public sealed class TokenSortIndex
 	{
 		var lanes = Vector256<T>.Count;
 		var width = (end - start + lanes - 1) / lanes * lanes;
-		var bkt = new Bucket<T>
-		{
-			PeqT = new T[alpha * width],
-			LenMaskCol = new T[width],
-			ItemLenCol = new int[width],
-			GroupMinLen = new int[width / lanes],
-			GroupMaxLen = new int[width / lanes],
-			SortedBase = start,
-		};
+		var groups = width / lanes;
+		var lenMaskCol = new T[width];
+		var itemLenCol = new int[width];
 		for (var t = start; t < end; t++)
 		{
-			var s = _itemsNorm[t];
-			var col = t - start;
-			bkt.ItemLenCol[col] = s.Length;
-			bkt.LenMaskCol[col] = T.CreateTruncating(LaneMask(s.Length));
-			for (var j = 0; j < s.Length; j++)
-				bkt.PeqT[_charIdx[s[j]] * width + col] |= T.CreateTruncating(1UL << j);
+			var len = _itemsNorm[t].Length;
+			itemLenCol[t - start] = len;
+			lenMaskCol[t - start] = T.CreateTruncating(LaneMask(len));
 		}
 		// Lanes ascend within a group (items are length-sorted; zero pads only at the tail).
-		for (var g = 0; g < bkt.GroupMinLen.Length; g++)
+		var groupMinLen = new int[groups];
+		var groupMaxLen = new int[groups];
+		for (var g = 0; g < groups; g++)
 		{
-			bkt.GroupMinLen[g] = bkt.ItemLenCol[g * lanes];
+			groupMinLen[g] = itemLenCol[g * lanes];
 			var mx = 0;
 			for (var lane = 0; lane < lanes; lane++)
-				mx = Math.Max(mx, bkt.ItemLenCol[g * lanes + lane]);
-			bkt.GroupMaxLen[g] = mx;
+				mx = Math.Max(mx, itemLenCol[g * lanes + lane]);
+			groupMaxLen[g] = mx;
 		}
-		return bkt;
+
+		// Grow each segment one lane group at a time while rows x width stays within
+		// SegmentCells; rows = 1 (the zero row) + distinct characters in the segment.
+		var segments = new List<Segment<T>>();
+		var segmentOf = new int[alpha]; // last segment number (1-based) that took each code
+		var groupOf = new int[alpha];   // last group number (1-based) that counted each code
+		int segment = 1, first = 0, rows = 1;
+		for (var g = 0; g < groups; g++)
+		{
+			var lo = start + g * lanes;
+			var hi = Math.Min(end, lo + lanes);
+			var added = 0;
+			for (var t = lo; t < hi; t++)
+				foreach (var c in _itemsNorm[t])
+				{
+					var code = _charIdx[c];
+					if (segmentOf[code] != segment && groupOf[code] != g + 1)
+					{
+						groupOf[code] = g + 1;
+						added++;
+					}
+				}
+			if (g > first && (long)(rows + added) * ((g + 1 - first) * lanes) > SegmentCells)
+			{
+				segments.Add(BuildSegment<T>(start, end, first * lanes, g * lanes, alpha));
+				segment++;
+				first = g;
+				rows = 1;
+			}
+			for (var t = lo; t < hi; t++)
+				foreach (var c in _itemsNorm[t])
+				{
+					var code = _charIdx[c];
+					if (segmentOf[code] != segment)
+					{
+						segmentOf[code] = segment;
+						rows++;
+					}
+				}
+		}
+		if (groups > 0)
+			segments.Add(BuildSegment<T>(start, end, first * lanes, width, alpha));
+
+		return new Bucket<T>
+		{
+			Segments = [.. segments],
+			LenMaskCol = lenMaskCol,
+			ItemLenCol = itemLenCol,
+			GroupMinLen = groupMinLen,
+			GroupMaxLen = groupMaxLen,
+			SortedBase = start,
+		};
+	}
+
+	/// <summary>
+	/// Table for bucket columns [<paramref name="col0"/>, <paramref name="col1"/>) of the
+	/// bucket whose first sorted item is <paramref name="start"/>.
+	/// </summary>
+	Segment<T> BuildSegment<T>(int start, int end, int col0, int col1, int alpha)
+		where T : unmanaged, IBinaryInteger<T>
+	{
+		var last = Math.Min(end, start + col1);
+		var (localCode, rows) = LocalAlphabet(start + col0, last, alpha);
+		var width = col1 - col0;
+		var peq = new T[rows * width];
+		for (var t = start + col0; t < last; t++)
+		{
+			var s = _itemsNorm[t];
+			var col = t - start - col0;
+			for (var j = 0; j < s.Length; j++)
+				peq[localCode[_charIdx[s[j]]] * width + col] |= T.CreateTruncating(1UL << j);
+		}
+		return new Segment<T>
+		{
+			Col0 = col0,
+			Width = width,
+			MinLen = _itemsNorm[start + col0].Length,
+			MaxLen = _itemsNorm[last - 1].Length,
+			LocalCode = localCode,
+			PeqT = peq,
+		};
+	}
+
+	/// <summary>
+	/// Numbers the distinct characters of sorted items [start, end) from row 1 upward.
+	/// Returns the global-code-to-row map (0 for absent characters) and the row count.
+	/// </summary>
+	(ushort[] LocalCode, int Rows) LocalAlphabet(int start, int end, int alpha)
+	{
+		var localCode = new ushort[alpha];
+		var rows = 1;
+		for (var t = start; t < end; t++)
+			foreach (var c in _itemsNorm[t])
+			{
+				ref var row = ref localCode[_charIdx[c]];
+				if (row == 0) row = (ushort)rows++;
+			}
+		return (localCode, rows);
 	}
 
 	static ulong LaneMask(int len) => len == 64 ? ulong.MaxValue : (1UL << len) - 1;
@@ -374,39 +494,48 @@ public sealed class TokenSortIndex
 	void ScanVector<T>(Bucket<T> bkt, Worker worker, int l1, ref int b, ref int bestIdx, ref bool done)
 		where T : unmanaged, IBinaryInteger<T>
 	{
-		var width = bkt.Width;
-		if (width == 0 || done) return;
+		if (done) return;
 		var lanes = Vector256<T>.Count;
-		var offsets = worker.Premultiply(width, l1); // codes[j] * width, hoisted
-		ref var peq0 = ref MemoryMarshal.GetArrayDataReference(bkt.PeqT);
-		ref var off0 = ref MemoryMarshal.GetArrayDataReference(offsets);
-		for (int g = 0, col0 = 0; col0 < width && !done; g++, col0 += lanes)
+		// Keep the segment loop in this method. A separate per-segment method made the first
+		// batches on a many-segment index about 3x slower, because it ran unoptimized tier-0
+		// code for longer; steady-state speed was the same.
+		foreach (var seg in bkt.Segments)
 		{
-			// Clamped group bound: ub(l1, l2) is unimodal in l2 with peak at l2 == l1,
-			// so ub(l1, clamp(l1, minLen, maxLen)) bounds every lane in the group.
-			var l2c = Math.Clamp(l1, bkt.GroupMinLen[g], bkt.GroupMaxLen[g]);
-			if (TokenSort.UpperBoundScore(l1, l2c) <= b) continue;
-
-			var s = Vector256.LoadUnsafe(ref bkt.LenMaskCol[col0]);
-			ref var peqCol = ref Unsafe.Add(ref peq0, col0);
-			for (var j = 0; j < l1; j++)
+			// The group bound over the segment's whole length range skips the query setup
+			// of segments that cannot beat the running best.
+			if (TokenSort.UpperBoundScore(l1, Math.Clamp(l1, seg.MinLen, seg.MaxLen)) <= b) continue;
+			var offsets = worker.Premultiply(seg.LocalCode, seg.Width, l1); // local row * width, hoisted
+			ref var peq0 = ref MemoryMarshal.GetArrayDataReference(seg.PeqT);
+			ref var off0 = ref MemoryMarshal.GetArrayDataReference(offsets);
+			var end = seg.Col0 + seg.Width;
+			for (int g = seg.Col0 / lanes, col0 = seg.Col0, local = 0; col0 < end; g++, col0 += lanes, local += lanes)
 			{
-				var m = Vector256.LoadUnsafe(ref Unsafe.Add(ref peqCol, Unsafe.Add(ref off0, j)));
-				var u = s & m;
-				s = (s + u) | (s - u);
-			}
+				// Clamped group bound: ub(l1, l2) is unimodal in l2 with peak at l2 == l1,
+				// so ub(l1, clamp(l1, minLen, maxLen)) bounds every lane in the group.
+				var l2c = Math.Clamp(l1, bkt.GroupMinLen[g], bkt.GroupMaxLen[g]);
+				if (TokenSort.UpperBoundScore(l1, l2c) <= b) continue;
 
-			for (var lane = 0; lane < lanes; lane++)
-			{
-				var l2 = bkt.ItemLenCol[col0 + lane];
-				if (l2 == 0) continue;
-				var lcs = BitOperations.PopCount(~ulong.CreateTruncating(s.GetElement(lane)) & LaneMask(l2));
-				var score = TokenSort.ScoreFromLcs(l1, l2, lcs);
-				if (score > b)
+				var s = Vector256.LoadUnsafe(ref bkt.LenMaskCol[col0]);
+				ref var peqCol = ref Unsafe.Add(ref peq0, local);
+				for (var j = 0; j < l1; j++)
 				{
-					b = score;
-					bestIdx = _sortedToOriginal[bkt.SortedBase + col0 + lane];
-					if (b == 100) { done = true; return; }
+					var m = Vector256.LoadUnsafe(ref Unsafe.Add(ref peqCol, Unsafe.Add(ref off0, j)));
+					var u = s & m;
+					s = (s + u) | (s - u);
+				}
+
+				for (var lane = 0; lane < lanes; lane++)
+				{
+					var l2 = bkt.ItemLenCol[col0 + lane];
+					if (l2 == 0) continue;
+					var lcs = BitOperations.PopCount(~ulong.CreateTruncating(s.GetElement(lane)) & LaneMask(l2));
+					var score = TokenSort.ScoreFromLcs(l1, l2, lcs);
+					if (score > b)
+					{
+						b = score;
+						bestIdx = _sortedToOriginal[bkt.SortedBase + col0 + lane];
+						if (b == 100) { done = true; return; }
+					}
 				}
 			}
 		}
@@ -415,33 +544,37 @@ public sealed class TokenSortIndex
 	/// <summary>Scalar fallback over the 64-bit bucket (all short items when SIMD is off).</summary>
 	void ScanScalar(Bucket<ulong> bkt, Worker worker, int l1, ref int b, ref int bestIdx, ref bool done)
 	{
-		var width = bkt.Width;
-		if (width == 0) return;
 		var lanes = Vector256<ulong>.Count;
-		var codes = worker.Codes;
-		for (int g = 0, col0 = 0; col0 < width && !done; g++, col0 += lanes)
+		foreach (var seg in bkt.Segments)
 		{
-			var l2c = Math.Clamp(l1, bkt.GroupMinLen[g], bkt.GroupMaxLen[g]);
-			if (TokenSort.UpperBoundScore(l1, l2c) <= b) continue;
-
-			for (var lane = 0; lane < lanes; lane++)
+			if (TokenSort.UpperBoundScore(l1, Math.Clamp(l1, seg.MinLen, seg.MaxLen)) <= b) continue;
+			var offsets = worker.Premultiply(seg.LocalCode, seg.Width, l1); // local row * width, hoisted
+			var peq = seg.PeqT;
+			var end = seg.Col0 + seg.Width;
+			for (int g = seg.Col0 / lanes, col0 = seg.Col0, local = 0; col0 < end; g++, col0 += lanes, local += lanes)
 			{
-				var l2 = bkt.ItemLenCol[col0 + lane];
-				if (l2 == 0) continue;
-				if (TokenSort.UpperBoundScore(l1, l2) <= b) continue;
-				var s = bkt.LenMaskCol[col0 + lane];
-				for (var j = 0; j < l1; j++)
+				var l2c = Math.Clamp(l1, bkt.GroupMinLen[g], bkt.GroupMaxLen[g]);
+				if (TokenSort.UpperBoundScore(l1, l2c) <= b) continue;
+
+				for (var lane = 0; lane < lanes; lane++)
 				{
-					var u = s & bkt.PeqT[codes[j] * width + col0 + lane];
-					unchecked { s = (s + u) | (s - u); }
-				}
-				var lcs = BitOperations.PopCount(~s & bkt.LenMaskCol[col0 + lane]);
-				var score = TokenSort.ScoreFromLcs(l1, l2, lcs);
-				if (score > b)
-				{
-					b = score;
-					bestIdx = _sortedToOriginal[bkt.SortedBase + col0 + lane];
-					if (b == 100) { done = true; break; }
+					var l2 = bkt.ItemLenCol[col0 + lane];
+					if (l2 == 0) continue;
+					if (TokenSort.UpperBoundScore(l1, l2) <= b) continue;
+					var s = bkt.LenMaskCol[col0 + lane];
+					for (var j = 0; j < l1; j++)
+					{
+						var u = s & peq[offsets[j] + local + lane];
+						unchecked { s = (s + u) | (s - u); }
+					}
+					var lcs = BitOperations.PopCount(~s & bkt.LenMaskCol[col0 + lane]);
+					var score = TokenSort.ScoreFromLcs(l1, l2, lcs);
+					if (score > b)
+					{
+						b = score;
+						bestIdx = _sortedToOriginal[bkt.SortedBase + col0 + lane];
+						if (b == 100) { done = true; return; }
+					}
 				}
 			}
 		}
@@ -454,10 +587,11 @@ public sealed class TokenSortIndex
 		s.Fill(ulong.MaxValue);
 		s[blocks - 1] = item.LastMask;
 		var peq = item.Peq;
+		var localCode = item.LocalCode;
 		var codes = worker.Codes;
 		for (var j = 0; j < l1; j++)
 		{
-			var off = codes[j] * blocks;
+			var off = localCode[codes[j]] * blocks;
 			ulong carry = 0;
 			for (var k = 0; k < blocks; k++)
 			{
@@ -496,12 +630,13 @@ public sealed class TokenSortIndex
 		grp.InitState.AsSpan().CopyTo(state);
 		ref var state0 = ref MemoryMarshal.GetReference(state);
 		ref var peq0 = ref MemoryMarshal.GetArrayDataReference(grp.PeqT);
+		var localCode = grp.LocalCode;
 		var codes = worker.Codes;
 		var rowStride = blocks * LongLanes;
 
 		for (var j = 0; j < l1; j++)
 		{
-			ref var row = ref Unsafe.Add(ref peq0, codes[j] * rowStride);
+			ref var row = ref Unsafe.Add(ref peq0, localCode[codes[j]] * rowStride);
 			var carry = Vector256<ulong>.Zero;
 			for (var k = 0; k < rowStride; k += LongLanes)
 			{
@@ -544,7 +679,7 @@ public sealed class TokenSortIndex
 		readonly Normalizer _normalizer = new();
 		ulong[] _blocks = [];
 
-		/// <summary>Alphabet code of each normalized query char.</summary>
+		/// <summary>Global alphabet code of each normalized query char.</summary>
 		public int[] Codes = new int[128];
 
 		public int Normalize(string query, ushort[] charIdx)
@@ -557,14 +692,17 @@ public sealed class TokenSortIndex
 			return len;
 		}
 
-		/// <summary>Bitmask row offsets (code * width) for one bucket; valid until the next call.</summary>
+		/// <summary>
+		/// Bitmask row offsets (local row * width) of the query chars in one segment table;
+		/// valid until the next call.
+		/// </summary>
 		int[] _offsets = new int[128];
 
-		public int[] Premultiply(int width, int l1)
+		public int[] Premultiply(ushort[] localCode, int width, int l1)
 		{
 			if (_offsets.Length < l1) _offsets = new int[Math.Max(l1, _offsets.Length * 2)];
 			for (var j = 0; j < l1; j++)
-				_offsets[j] = Codes[j] * width;
+				_offsets[j] = localCode[Codes[j]] * width;
 			return _offsets;
 		}
 

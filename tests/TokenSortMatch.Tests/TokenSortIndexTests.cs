@@ -188,6 +188,44 @@ public class TokenSortIndexTests
 	}
 
 	[Fact]
+	public void Large_alphabets_score_exactly()
+	{
+		// ~2,000 distinct CJK characters over 1,000 items: every length bucket splits its
+		// bitmask table into several segments with their own alphabets, and the long items
+		// get per-group alphabets. Half the queries are edited items, so best scores are
+		// high and pruning and early exits kick in.
+		var rnd = new Random(11);
+		string Word(int length) =>
+			new(Enumerable.Range(0, length).Select(_ => (char)(0x4E00 + rnd.Next(3000))).ToArray());
+		var items = Enumerable.Range(0, 1000)
+			.Select(i => i % 10 == 9 ? $"{Word(40)} {Word(40)}" : Word(1 + rnd.Next(64)))
+			.ToArray();
+		var queries = Enumerable.Range(0, 150).Select(i =>
+		{
+			if (i % 2 == 1) return Word(1 + rnd.Next(64));
+			var chars = items[rnd.Next(items.Length)].ToCharArray();
+			chars[rnd.Next(chars.Length)] = (char)(0x4E00 + rnd.Next(3000));
+			return new string(chars);
+		}).ToArray();
+		var index = new TokenSortIndex(items);
+
+		var scores = index.FindBestScores(queries, 0);
+		var matches = index.FindBestMatches(queries, 60);
+		for (var i = 0; i < queries.Length; i++)
+		{
+			var expected = items.Max(it => TokenSort.Ratio(queries[i], it));
+			Assert.Equal(expected, scores[i]);
+			if (expected < 60)
+			{
+				Assert.Null(matches[i]);
+				continue;
+			}
+			Assert.Equal(expected, matches[i]!.Value.Score);
+			Assert.Equal(expected, TokenSort.Ratio(queries[i], items[matches[i]!.Value.ItemIndex]));
+		}
+	}
+
+	[Fact]
 	public void Surrogate_pairs_are_treated_as_non_alphanumeric()
 	{
 		// Emoji are surrogate pairs; per-char preprocessing maps both halves to spaces.
