@@ -18,14 +18,15 @@ public class OracleEquivalenceTests
 		"    --__{}!?.,;:'\"“”«»";
 
 	/// <summary>
-	/// Independent reimplementation of full preprocessing (lowercase letters/digits,
-	/// everything else becomes a token separator) followed by ordinal token sort.
+	/// Independent reimplementation of full preprocessing (letters/digits lowercased
+	/// culture-invariantly with Unicode's 'İ' -> 'i', everything else becomes a token
+	/// separator) followed by ordinal token sort.
 	/// </summary>
 	static string OracleNormalize(string s)
 	{
 		var mapped = new char[s.Length];
 		for (var i = 0; i < s.Length; i++)
-			mapped[i] = char.IsLetterOrDigit(s[i]) ? char.ToLower(s[i]) : ' ';
+			mapped[i] = !char.IsLetterOrDigit(s[i]) ? ' ' : s[i] == 'İ' ? 'i' : char.ToLowerInvariant(s[i]);
 		var tokens = new string(mapped)
 			.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 		Array.Sort(tokens, StringComparer.Ordinal);

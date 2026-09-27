@@ -14,7 +14,9 @@ public static class TokenSort
 {
 	/// <summary>
 	/// Normalized char (lowercase letter/digit, or ' ') for every UTF-16 code unit;
-	/// surrogate halves map to ' ', matching per-char preprocessors.
+	/// surrogate halves map to ' '. Lowercasing is culture-invariant, so the table does not
+	/// depend on the culture that happens to be current when it is built (under tr-TR,
+	/// <c>char.ToLower('I')</c> is 'ı').
 	/// </summary>
 	internal static readonly char[] MapChar = BuildMapChar();
 
@@ -22,7 +24,10 @@ public static class TokenSort
 	{
 		var table = new char[65536];
 		for (var c = 0; c < 65536; c++)
-			table[c] = char.IsLetterOrDigit((char)c) ? char.ToLower((char)c) : ' ';
+			table[c] = char.IsLetterOrDigit((char)c) ? char.ToLowerInvariant((char)c) : ' ';
+		// .NET's invariant casing leaves 'İ' (U+0130) unchanged. Unicode's simple lowercase
+		// mapping gives 'i', and so do RapidFuzz and the en-US culture.
+		table['\u0130'] = 'i';
 		return table;
 	}
 

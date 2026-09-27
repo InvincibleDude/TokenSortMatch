@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Runtime.Loader;
 using TokenSortMatch;
 using Xunit;
 
@@ -86,6 +88,30 @@ public class TokenSortRatioTests
 		Assert.Equal("12 5 занятия курс лекционные", TokenSort.Normalize("Лекционные занятия 12 курс 5"));
 		Assert.Equal("brown fox quick the", TokenSort.Normalize("The-Quick! Brown?? fox"));
 		Assert.Equal(string.Empty, TokenSort.Normalize("!!! ---"));
+	}
+
+	[Fact]
+	public void Normalization_does_not_depend_on_the_current_culture()
+	{
+		// The char map is built once per process, so load a fresh copy of the library and
+		// make its first call under tr-TR, where char.ToLower('I') is 'ı'. 'İ' must become
+		// 'i' as in Unicode's simple lowercase mapping (and RapidFuzz); .NET's invariant
+		// casing alone leaves it unchanged.
+		var context = new AssemblyLoadContext(nameof(Normalization_does_not_depend_on_the_current_culture), isCollectible: true);
+		var saved = CultureInfo.CurrentCulture;
+		try
+		{
+			var normalize = context.LoadFromAssemblyPath(typeof(TokenSort).Assembly.Location)
+				.GetType("TokenSortMatch.TokenSort", throwOnError: true)!
+				.GetMethod(nameof(TokenSort.Normalize))!;
+			CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("tr-TR");
+			Assert.Equal("info istanbul", (string?)normalize.Invoke(null, ["INFO İSTANBUL"]));
+		}
+		finally
+		{
+			CultureInfo.CurrentCulture = saved;
+			context.Unload();
+		}
 	}
 
 	[Fact]
