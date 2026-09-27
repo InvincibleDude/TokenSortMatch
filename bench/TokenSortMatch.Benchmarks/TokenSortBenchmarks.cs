@@ -28,7 +28,7 @@ public class TokenSortBenchmarks
 	[Benchmark] public int[] Index_Long_Cutoff80() => _long.FindBestScores(_queriesLong, 80);
 	[Benchmark] public int[] Index_Long_Cutoff0() => _long.FindBestScores(_queriesLong, 0);
 
-	/// <summary>Per-pair FuzzySharp baseline on the first 500 short queries (100k pairs).</summary>
-	[Benchmark] public int[] FuzzySharp_Short_Brute500() =>
-		QuickBench.FuzzySharpBrute(_itemsShort, _queriesShort[..500]);
+	/// <summary>Per-pair Raffinert.FuzzySharp baseline on the first 500 short queries (100k pairs).</summary>
+	[Benchmark] public int[] Raffinert_Short_Brute500() =>
+		QuickBench.RaffinertBrute(_itemsShort, _queriesShort[..500]);
 }
