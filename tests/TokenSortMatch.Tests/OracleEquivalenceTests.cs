@@ -1,14 +1,16 @@
-using FuzzySharp;
+using Raffinert.FuzzySharp;
 using TokenSortMatch;
 using Xunit;
 
 namespace TokenSortMatch.Tests;
 
 /// <summary>
-/// Randomized equivalence against FuzzySharp as the oracle: every score the
+/// Randomized equivalence against Raffinert.FuzzySharp as the oracle: every score the
 /// library produces must be bit-identical to
-/// <c>Fuzz.Ratio(OracleNormalize(a), OracleNormalize(b))</c> — the exact definition the
-/// automatch harness verifies against. The oracle package is a test-only dependency.
+/// <c>round(Fuzz.Ratio(OracleNormalize(a), OracleNormalize(b)))</c> with banker's
+/// rounding. Its <c>Fuzz.Ratio</c> uses RapidFuzz's floating-point expression, so exact
+/// .5 scores round like RapidFuzz; the original FuzzySharp package rounds some of them
+/// the other way. The oracle package is a test-only dependency.
 /// </summary>
 public class OracleEquivalenceTests
 {
@@ -34,7 +36,7 @@ public class OracleEquivalenceTests
 	}
 
 	static int OracleRatio(string a, string b) =>
-		Fuzz.Ratio(OracleNormalize(a), OracleNormalize(b));
+		(int)Math.Round(Fuzz.Ratio(OracleNormalize(a), OracleNormalize(b)));
 
 	static string RandomString(Random rnd, int maxLen)
 	{
@@ -81,6 +83,32 @@ public class OracleEquivalenceTests
 			var b = RandomString(rnd, 400);
 			Assert.Equal(OracleRatio(a, b), TokenSort.Ratio(a, b));
 		}
+	}
+
+	/// <summary>
+	/// Every exact .5 score up to a combined length of 1000. Random pairs almost never hit
+	/// one, and they are the only cases where the floating-point expression decides the
+	/// rounding. The index check with threshold == score fails if the pruning bound is
+	/// computed differently from the score and rounds below it.
+	/// </summary>
+	[Fact]
+	public void Exact_half_scores_round_like_the_oracle()
+	{
+		for (var total = 2; total <= 1000; total++)
+			for (var lcs = 1; 2 * lcs <= total; lcs++)
+			{
+				if (400 * lcs % total != 0 || 400 * lcs / total % 2 == 0) continue; // 200·lcs/total == k + 0.5
+				// An even split (lcs below both lengths) and a contained string (lcs equals the
+				// shorter length, so the pruning bound is evaluated at the score itself).
+				foreach (var l1 in new[] { total / 2, lcs })
+				{
+					var a = new string('a', lcs) + new string('x', l1 - lcs);
+					var b = new string('a', lcs) + new string('y', total - l1 - lcs);
+					var expected = OracleRatio(a, b);
+					Assert.Equal(expected, TokenSort.Ratio(a, b));
+					Assert.Equal(new BestMatch(0, expected), new TokenSortIndex([b]).FindBest(a, expected));
+				}
+			}
 	}
 
 	[Theory]

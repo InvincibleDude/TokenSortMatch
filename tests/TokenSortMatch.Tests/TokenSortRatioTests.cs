@@ -6,10 +6,9 @@ using Xunit;
 namespace TokenSortMatch.Tests;
 
 /// <summary>
-/// Adapted from FuzzySharp's FuzzySharp.Test/FuzzyTests/RatioTests.cs for
-/// token-sort-ratio semantics: <see cref="TokenSort.Ratio"/> is equivalent to
-/// <c>Fuzz.TokenSortRatio(a, b)</c> with full preprocessing, so expectations follow
-/// the full-preprocessing token-sort variants of the original suite.
+/// Adapted from FuzzySharp's FuzzySharp.Test/FuzzyTests/RatioTests.cs for token-sort
+/// semantics (full preprocessing, ordinal token sort): expectations follow the
+/// full-preprocessing token-sort variants of the original suite.
 /// </summary>
 public class TokenSortRatioTests
 {
