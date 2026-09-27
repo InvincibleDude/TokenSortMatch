@@ -117,24 +117,21 @@ public static class TokenSort
 		foreach (var c in txt)
 		{
 			peq.TryGetValue(c, out var row);
-			ulong carry = 0, borrow = 0;
+			ulong carry = 0;
 			for (var k = 0; k < blocks; k++)
 			{
 				var sk = s[k];
 				var u = row is null ? 0 : sk & row[k];
 				unchecked
 				{
+					// Only the addition carries across blocks: u is a bitwise subset of sk,
+					// so sk - u never borrows.
 					var t = sk + u;
 					var c1 = t < sk ? 1UL : 0UL;
 					var sum = t + carry;
 					var c2 = sum < t ? 1UL : 0UL;
 					carry = c1 | c2;
-					var t1 = sk - u;
-					var b1 = sk < u ? 1UL : 0UL;
-					var diff = t1 - borrow;
-					var b2 = t1 < borrow ? 1UL : 0UL;
-					borrow = b1 | b2;
-					s[k] = sum | diff;
+					s[k] = sum | (sk - u);
 				}
 			}
 		}

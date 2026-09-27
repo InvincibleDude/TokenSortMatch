@@ -65,9 +65,9 @@ public sealed class TokenSortIndex
 
 	/// <summary>
 	/// Four long items scored per pass in <see cref="Vector256{T}"/> ulong lanes, with
-	/// the multi-block carry/borrow chains carried per lane. Lanes past a lane's real
-	/// block count stay all-ones pads (their bitmask rows are zero and block carries
-	/// only propagate upward), so short lanes coexist with the group's longest item.
+	/// the multi-block carry chains carried per lane. Lanes past a lane's real block
+	/// count stay all-ones pads (their bitmask rows are zero and block carries only
+	/// propagate upward), so short lanes coexist with the group's longest item.
 	/// </summary>
 	sealed class LongGroup
 	{
@@ -132,7 +132,7 @@ public sealed class TokenSortIndex
 
 		if (Vector256.IsHardwareAccelerated)
 		{
-			// Long items in groups of 4 ulong lanes, vectorized carry/borrow chains.
+			// Long items in groups of 4 ulong lanes, vectorized carry chains.
 			_longItems = [];
 			_longGroups = new LongGroup[(n - bpEnd + LongLanes - 1) / LongLanes];
 			for (var g = 0; g < _longGroups.Length; g++)
@@ -458,24 +458,21 @@ public sealed class TokenSortIndex
 		for (var j = 0; j < l1; j++)
 		{
 			var off = codes[j] * blocks;
-			ulong carry = 0, borrow = 0;
+			ulong carry = 0;
 			for (var k = 0; k < blocks; k++)
 			{
 				var sk = s[k];
 				var u = sk & peq[off + k];
 				unchecked
 				{
+					// Only the addition carries across blocks: u is a bitwise subset of sk,
+					// so sk - u never borrows.
 					var t = sk + u;
 					var c1 = t < sk ? 1UL : 0UL;
 					var sum = t + carry;
 					var c2 = sum < t ? 1UL : 0UL;
 					carry = c1 | c2;
-					var t1 = sk - u;
-					var b1 = sk < u ? 1UL : 0UL;
-					var diff = t1 - borrow;
-					var b2 = t1 < borrow ? 1UL : 0UL;
-					borrow = b1 | b2;
-					s[k] = sum | diff;
+					s[k] = sum | (sk - u);
 				}
 			}
 		}
@@ -483,11 +480,11 @@ public sealed class TokenSortIndex
 	}
 
 	/// <summary>
-	/// Multi-block LCS over four long items at once: the scalar carry/borrow chains of
-	/// <see cref="LcsLong"/> run per ulong lane. Carry-out of <c>sk + u + carry</c> is
-	/// the classic full-adder MSB <c>(a&amp;b | (a|b)&amp;~sum) &gt;&gt; 63</c>; the
-	/// subtraction never borrows from <c>sk - u</c> itself (u ⊆ sk bitwise), only from
-	/// the injected borrow bit, so borrow-out is <c>(sk - u == 0) &amp; borrow</c>.
+	/// Multi-block LCS over four long items at once: the scalar carry chain of
+	/// <see cref="LcsLong"/> runs per ulong lane. AVX2 has no vector add-with-carry, so the
+	/// carry-out of <c>sk + u + carry</c> is the full-adder MSB
+	/// <c>(a&amp;b | (a|b)&amp;~sum) &gt;&gt; 63</c>. The subtraction needs no chain: u is a
+	/// bitwise subset of sk, so <c>sk - u</c> never borrows.
 	/// </summary>
 	void ScanLongGroup(LongGroup grp, Worker worker, int l1, ref int b, ref int bestIdx, ref bool done)
 	{
@@ -506,17 +503,13 @@ public sealed class TokenSortIndex
 		{
 			ref var row = ref Unsafe.Add(ref peq0, codes[j] * rowStride);
 			var carry = Vector256<ulong>.Zero;
-			var borrow = Vector256<ulong>.Zero;
 			for (var k = 0; k < rowStride; k += LongLanes)
 			{
 				var sk = Vector256.LoadUnsafe(ref Unsafe.Add(ref state0, k));
 				var u = sk & Vector256.LoadUnsafe(ref Unsafe.Add(ref row, k));
 				var sum = sk + u + carry;
 				carry = ((sk & u) | ((sk | u) & ~sum)) >>> 63;
-				var t1 = sk - u;
-				var diff = t1 - borrow;
-				borrow = Vector256.Equals(t1, Vector256<ulong>.Zero) & borrow;
-				(sum | diff).StoreUnsafe(ref Unsafe.Add(ref state0, k));
+				(sum | (sk - u)).StoreUnsafe(ref Unsafe.Add(ref state0, k));
 			}
 		}
 
