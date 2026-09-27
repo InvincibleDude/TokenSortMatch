@@ -3,11 +3,11 @@ using System.Numerics;
 namespace TokenSortMatch;
 
 /// <summary>
-/// Token-sort similarity with exact RapidFuzz/FuzzySharp semantics:
-/// <c>Ratio(a, b) == Fuzz.Ratio(Normalize(a), Normalize(b))</c> where normalization
-/// lowercases letters/digits, replaces everything else with spaces, splits, sorts the
-/// tokens ordinally and re-joins with single spaces. The score is the indel similarity
-/// <c>round(100 * (1 - dist / (len1 + len2)))</c> (banker's rounding), where
+/// Token-sort similarity with RapidFuzz semantics: <c>Ratio(a, b)</c> equals RapidFuzz's
+/// <c>fuzz.ratio(Normalize(a), Normalize(b))</c> with banker's rounding. Normalization
+/// lowercases letters/digits (culture-invariant), replaces everything else with spaces,
+/// splits, sorts the tokens ordinally and re-joins with single spaces. The score is the
+/// indel similarity <c>round(100 * (1 - dist / (len1 + len2)))</c>, where
 /// <c>dist = len1 + len2 - 2 * LCS</c>.
 /// </summary>
 public static class TokenSort
@@ -68,8 +68,11 @@ public static class TokenSort
 	}
 
 	/// <summary>
-	/// FuzzySharp's score formula replicated operation-for-operation: results must stay
-	/// bit-identical, including banker's rounding at .5 boundaries.
+	/// RapidFuzz's normalized indel similarity, evaluated with the same double operations
+	/// (<c>1 - dist / lensum</c>, then <c>* 100</c>) so that exact .5 scores round the same
+	/// way. Raffinert.FuzzySharp's <c>Fuzz.Ratio</c> computes the same value. The original
+	/// FuzzySharp package computes <c>(lensum - dist) / lensum</c>, which rounds a few exact
+	/// .5 scores differently.
 	/// </summary>
 	internal static int ScoreFromLcs(int l1, int l2, int lcs)
 	{
@@ -77,14 +80,18 @@ public static class TokenSort
 		return (int)Math.Round(100 * (1 - dist / (double)(l1 + l2)));
 	}
 
-	/// <summary>Exactly-rounded score upper bound for lengths (l1, l2): lcs &lt;= min.</summary>
+	/// <summary>
+	/// Highest score any pair with lengths (l1, l2) can reach, since lcs &lt;= min(l1, l2).
+	/// Uses the same expression as <see cref="ScoreFromLcs"/>, so it is never below an
+	/// attainable score.
+	/// </summary>
 	internal static int UpperBoundScore(int l1, int l2)
 	{
 		var minDist = l1 >= l2 ? l1 - l2 : l2 - l1;
 		return (int)Math.Round(100 * (1 - minDist / (double)(l1 + l2)));
 	}
 
-	// Bit-parallel LCS (Hyyrö/Myers), pattern <= 64 chars.
+	// Bit-parallel LCS (Hyyrö 2004), pattern <= 64 chars.
 	static int LcsSingle(ReadOnlySpan<char> pat, ReadOnlySpan<char> txt)
 	{
 		var peq = new Dictionary<char, ulong>(pat.Length);

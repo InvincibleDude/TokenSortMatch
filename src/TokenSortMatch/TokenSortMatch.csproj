@@ -8,7 +8,7 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <PackageId>TokenSortMatch</PackageId>
     <Version>0.2.0</Version>
-    <Description>Fast token-sort fuzzy best-match. SIMD bit-parallel LCS (Hyyrö/Myers) with exact RapidFuzz/FuzzySharp token-sort-ratio semantics and zero per-pair allocations. No dependencies.</Description>
+    <Description>Fast token-sort fuzzy best-match. SIMD bit-parallel LCS (Hyyrö) with RapidFuzz token-sort-ratio semantics and zero per-pair allocations. No dependencies.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageTags>fuzzy-matching;levenshtein;indel;token-sort;simd;rapidfuzz;fuzzysharp</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
