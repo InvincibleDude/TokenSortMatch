@@ -128,10 +128,12 @@ public class OracleEquivalenceTests
 
 		for (var i = 0; i < queries.Length; i++)
 		{
+			var all = index.ScoreAll(queries[i], threshold);
 			var golden = -1;
-			foreach (var it in items)
+			for (var j = 0; j < items.Length; j++)
 			{
-				var score = OracleRatio(queries[i], it);
+				var score = OracleRatio(queries[i], items[j]);
+				Assert.Equal(score >= threshold ? score : -1, all[j]);
 				if (score > golden) golden = score;
 			}
 			var expected = golden >= threshold ? golden : -1;

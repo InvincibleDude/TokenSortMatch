@@ -38,6 +38,10 @@ BestMatch? best = index.FindBest("занятия лекционные 5", thresh
 
 int[] scores = index.FindBestScores(queries, threshold: 80);      // parallel, -1 if below
 BestMatch?[] all = index.FindBestMatches(queries, threshold: 80); // parallel, null if below
+
+// One query against every item: a score per item, in constructor order
+int[] each = index.ScoreAll("занятия лекционные 5", threshold: 0);  // -> [95, 60, 30]
+index.ScoreAll("занятия лекционные 5", threshold: 80, buffer);     // into a Span<int>: [95, -1, -1]
 ```
 
 Semantics:
@@ -50,6 +54,10 @@ Semantics:
   same way; empty normalized strings score 0.
 - `FindBest*`: thresholds ≤ 0 always match (scores are non-negative); ties return one
   deterministic best-scoring item. `TokenSortIndex` is immutable and thread-safe.
+- `ScoreAll`: item `i` gets `Ratio(query, items[i])` if it reaches the threshold, else -1,
+  so a threshold ≤ 0 returns every score. It runs on the calling thread and skips item
+  groups whose lengths cannot reach the threshold. The `Span<int>` overload allocates
+  nothing; it writes the first `Count` entries.
 
 ## Compatibility
 

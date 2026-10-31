@@ -73,12 +73,50 @@ public class TokenSortIndexTests
 	}
 
 	[Fact]
+	public void ScoreAll_equals_Ratio_for_every_item()
+	{
+		// Every length bucket, the multi-block path, empty and punctuation-only items, and
+		// queries that equal, are edited from or share nothing with the items.
+		var rnd = new Random(23);
+		string Word(int length) =>
+			new(Enumerable.Range(0, length).Select(_ => "abcdefgзанятия"[rnd.Next(14)]).ToArray());
+		var items = new List<string> { "", "???", "Экзамен" };
+		foreach (var length in new[] { 1, 2, 5, 15, 16, 17, 31, 32, 33, 63, 64, 65, 130, 300 })
+			for (var copy = 0; copy < 3; copy++)
+				items.Add(copy == 2 ? $"{Word(length / 2)} {Word(length - length / 2)}" : Word(length));
+		var queries = items
+			.Select(it => it.Length > 1 ? it.Remove(rnd.Next(it.Length), 1) : it)
+			.Concat(items)
+			.Concat(["", "!!!", "zzz", "занятия abc"])
+			.ToArray();
+		var index = new TokenSortIndex(items);
+
+		foreach (var threshold in new[] { -5, 0, 1, 50, 80, 100, 101 })
+			foreach (var q in queries)
+			{
+				var expected = items.Select(it => TokenSort.Ratio(q, it)).Select(r => r >= threshold ? r : -1);
+				Assert.Equal(expected, index.ScoreAll(q, threshold));
+			}
+	}
+
+	[Fact]
+	public void ScoreAll_fills_only_the_first_Count_entries_of_a_longer_buffer()
+	{
+		var index = new TokenSortIndex(Items);
+		var buffer = Enumerable.Repeat(42, Items.Length + 3).ToArray();
+		index.ScoreAll("экзамен", 0, buffer);
+		Assert.Equal(index.ScoreAll("экзамен", 0), buffer[..Items.Length]);
+		Assert.Equal([42, 42, 42], buffer[Items.Length..]);
+	}
+
+	[Fact]
 	public void Empty_index_never_matches()
 	{
 		var index = new TokenSortIndex([]);
 		Assert.Equal(0, index.Count);
 		Assert.Null(index.FindBest("anything", 0));
 		Assert.Equal(-1, index.FindBestScores(["anything"], 80)[0]);
+		Assert.Empty(index.ScoreAll("anything", 0));
 	}
 
 	[Fact]
@@ -213,8 +251,10 @@ public class TokenSortIndexTests
 		var matches = index.FindBestMatches(queries, 60);
 		for (var i = 0; i < queries.Length; i++)
 		{
-			var expected = items.Max(it => TokenSort.Ratio(queries[i], it));
+			var ratios = items.Select(it => TokenSort.Ratio(queries[i], it)).ToArray();
+			var expected = ratios.Max();
 			Assert.Equal(expected, scores[i]);
+			Assert.Equal(ratios.Select(r => r >= 60 ? r : -1), index.ScoreAll(queries[i], 60));
 			if (expected < 60)
 			{
 				Assert.Null(matches[i]);
@@ -245,5 +285,7 @@ public class TokenSortIndexTests
 		Assert.Throws<ArgumentNullException>(() => index.FindBestScores(null!, 80));
 		Assert.Throws<ArgumentException>(() => index.FindBestScores(["ok", null!], 80));
 		Assert.Throws<ArgumentException>(() => index.FindBestMatches([null!], 80));
+		Assert.Throws<ArgumentNullException>(() => index.ScoreAll(null!, 80));
+		Assert.Throws<ArgumentException>(() => index.ScoreAll("ok", 80, new int[Items.Length - 1]));
 	}
 }

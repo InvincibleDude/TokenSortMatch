@@ -431,6 +431,68 @@ public sealed class TokenSortIndex
 		return best;
 	}
 
+	/// <summary>
+	/// Scores <paramref name="query"/> against every item. <c>result[i]</c> is
+	/// <see cref="TokenSort.Ratio"/>(query, items[i]) if it reaches
+	/// <paramref name="threshold"/>, else -1; with a threshold of 0 or less every item gets
+	/// its score.
+	/// </summary>
+	/// <remarks>
+	/// Runs on the calling thread. Groups of items whose lengths cannot reach the threshold
+	/// are skipped without scoring, so a higher threshold is faster.
+	/// </remarks>
+	/// <exception cref="ArgumentNullException"><paramref name="query"/> is null.</exception>
+	public int[] ScoreAll(string query, int threshold)
+	{
+		var scores = new int[Count];
+		ScoreAll(query, threshold, scores);
+		return scores;
+	}
+
+	/// <summary>
+	/// Allocation-free variant of <see cref="ScoreAll(string, int)"/>: writes the score of
+	/// item i to <c>scores[i]</c> for every i below <see cref="Count"/> and leaves the rest
+	/// of <paramref name="scores"/> unchanged.
+	/// </summary>
+	/// <exception cref="ArgumentNullException"><paramref name="query"/> is null.</exception>
+	/// <exception cref="ArgumentException"><paramref name="scores"/> is shorter than <see cref="Count"/>.</exception>
+	public void ScoreAll(string query, int threshold, Span<int> scores)
+	{
+		ArgumentNullException.ThrowIfNull(query);
+		if (scores.Length < Count)
+			throw new ArgumentException(
+				$"scores has {scores.Length} elements; the index has {Count} items.", nameof(scores));
+
+		scores = scores[..Count];
+		// Pairs with an empty side score 0: empty items, and every item for an empty query.
+		scores.Fill(threshold > 0 ? -1 : 0);
+		var worker = GetWorker();
+		var l1 = worker.Normalize(query, _charIdx);
+		if (l1 == 0) return;
+
+		// The bar never rises: every item at or above the threshold keeps its own score.
+		var b = threshold > 0 ? threshold - 1 : -1;
+		if (Vector256.IsHardwareAccelerated)
+		{
+			ScoreVector(_b16, worker, l1, b, scores);
+			ScoreVector(_b32, worker, l1, b, scores);
+			ScoreVector(_b64, worker, l1, b, scores);
+		}
+		else
+		{
+			ScoreScalar(_b64, worker, l1, b, scores);
+		}
+
+		foreach (var grp in _longGroups)
+			ScoreLongGroup(grp, worker, l1, b, scores);
+		foreach (var item in _longItems)
+		{
+			if (TokenSort.UpperBoundScore(l1, item.Length) <= b) continue;
+			var score = TokenSort.ScoreFromLcs(l1, item.Length, LcsLong(item, worker, l1));
+			if (score > b) scores[item.OriginalIndex] = score;
+		}
+	}
+
 	(int Score, int Index) FindBestCore(string query, int threshold, Worker worker)
 	{
 		// Scores are never negative, so any threshold <= 0 behaves like "best always
@@ -669,11 +731,132 @@ public sealed class TokenSortIndex
 		}
 	}
 
+	// The Score* methods run the same recurrences as the Scan* methods above, with a fixed
+	// bar, and write each item's score instead of keeping the best. They are separate
+	// methods so the best-match loops keep their exact shape and speed.
+
+	/// <summary><see cref="ScanVector{T}"/> for <see cref="ScoreAll(string, int, Span{int})"/>.</summary>
+	void ScoreVector<T>(Bucket<T> bkt, Worker worker, int l1, int b, Span<int> scores)
+		where T : unmanaged, IBinaryInteger<T>
+	{
+		var lanes = Vector256<T>.Count;
+		foreach (var seg in bkt.Segments)
+		{
+			if (TokenSort.UpperBoundScore(l1, Math.Clamp(l1, seg.MinLen, seg.MaxLen)) <= b) continue;
+			var offsets = worker.Premultiply(seg.LocalCode, seg.Width, l1);
+			ref var peq0 = ref MemoryMarshal.GetArrayDataReference(seg.PeqT);
+			ref var off0 = ref MemoryMarshal.GetArrayDataReference(offsets);
+			var end = seg.Col0 + seg.Width;
+			for (int g = seg.Col0 / lanes, col0 = seg.Col0, local = 0; col0 < end; g++, col0 += lanes, local += lanes)
+			{
+				var l2c = Math.Clamp(l1, bkt.GroupMinLen[g], bkt.GroupMaxLen[g]);
+				if (TokenSort.UpperBoundScore(l1, l2c) <= b) continue;
+
+				var s = Vector256.LoadUnsafe(ref bkt.LenMaskCol[col0]);
+				ref var peqCol = ref Unsafe.Add(ref peq0, local);
+				for (var j = 0; j < l1; j++)
+				{
+					var m = Vector256.LoadUnsafe(ref Unsafe.Add(ref peqCol, Unsafe.Add(ref off0, j)));
+					var u = s & m;
+					s = (s + u) | (s - u);
+				}
+
+				for (var lane = 0; lane < lanes; lane++)
+				{
+					var l2 = bkt.ItemLenCol[col0 + lane];
+					if (l2 == 0) continue;
+					var lcs = BitOperations.PopCount(~ulong.CreateTruncating(s.GetElement(lane)) & LaneMask(l2));
+					var score = TokenSort.ScoreFromLcs(l1, l2, lcs);
+					if (score > b) scores[_sortedToOriginal[bkt.SortedBase + col0 + lane]] = score;
+				}
+			}
+		}
+	}
+
+	/// <summary><see cref="ScanScalar"/> for <see cref="ScoreAll(string, int, Span{int})"/>.</summary>
+	void ScoreScalar(Bucket<ulong> bkt, Worker worker, int l1, int b, Span<int> scores)
+	{
+		var lanes = Vector256<ulong>.Count;
+		foreach (var seg in bkt.Segments)
+		{
+			if (TokenSort.UpperBoundScore(l1, Math.Clamp(l1, seg.MinLen, seg.MaxLen)) <= b) continue;
+			var offsets = worker.Premultiply(seg.LocalCode, seg.Width, l1);
+			var peq = seg.PeqT;
+			var end = seg.Col0 + seg.Width;
+			for (int g = seg.Col0 / lanes, col0 = seg.Col0, local = 0; col0 < end; g++, col0 += lanes, local += lanes)
+			{
+				var l2c = Math.Clamp(l1, bkt.GroupMinLen[g], bkt.GroupMaxLen[g]);
+				if (TokenSort.UpperBoundScore(l1, l2c) <= b) continue;
+
+				for (var lane = 0; lane < lanes; lane++)
+				{
+					var l2 = bkt.ItemLenCol[col0 + lane];
+					if (l2 == 0) continue;
+					if (TokenSort.UpperBoundScore(l1, l2) <= b) continue;
+					var s = bkt.LenMaskCol[col0 + lane];
+					for (var j = 0; j < l1; j++)
+					{
+						var u = s & peq[offsets[j] + local + lane];
+						unchecked { s = (s + u) | (s - u); }
+					}
+					var lcs = BitOperations.PopCount(~s & bkt.LenMaskCol[col0 + lane]);
+					var score = TokenSort.ScoreFromLcs(l1, l2, lcs);
+					if (score > b) scores[_sortedToOriginal[bkt.SortedBase + col0 + lane]] = score;
+				}
+			}
+		}
+	}
+
+	/// <summary><see cref="ScanLongGroup"/> for <see cref="ScoreAll(string, int, Span{int})"/>.</summary>
+	void ScoreLongGroup(LongGroup grp, Worker worker, int l1, int b, Span<int> scores)
+	{
+		var l2c = Math.Clamp(l1, grp.MinLen, grp.MaxLen);
+		if (TokenSort.UpperBoundScore(l1, l2c) <= b) return;
+
+		var blocks = grp.Blocks;
+		var state = worker.Blocks(_maxBlocks * LongLanes).AsSpan(0, blocks * LongLanes);
+		grp.InitState.AsSpan().CopyTo(state);
+		ref var state0 = ref MemoryMarshal.GetReference(state);
+		ref var peq0 = ref MemoryMarshal.GetArrayDataReference(grp.PeqT);
+		var localCode = grp.LocalCode;
+		var codes = worker.Codes;
+		var rowStride = blocks * LongLanes;
+
+		for (var j = 0; j < l1; j++)
+		{
+			ref var row = ref Unsafe.Add(ref peq0, localCode[codes[j]] * rowStride);
+			var carry = Vector256<ulong>.Zero;
+			for (var k = 0; k < rowStride; k += LongLanes)
+			{
+				var sk = Vector256.LoadUnsafe(ref Unsafe.Add(ref state0, k));
+				var u = sk & Vector256.LoadUnsafe(ref Unsafe.Add(ref row, k));
+				var sum = sk + u + carry;
+				carry = ((sk & u) | ((sk | u) & ~sum)) >>> 63;
+				(sum | (sk - u)).StoreUnsafe(ref Unsafe.Add(ref state0, k));
+			}
+		}
+
+		for (var lane = 0; lane < LongLanes; lane++)
+		{
+			var l2 = grp.Lengths[lane];
+			if (l2 == 0) continue;
+			if (TokenSort.UpperBoundScore(l1, l2) <= b) continue;
+			var laneBlocks = (l2 + 63) >> 6;
+			var zeros = 0;
+			for (var k = 0; k < laneBlocks - 1; k++)
+				zeros += BitOperations.PopCount(~state[k * LongLanes + lane]);
+			zeros += BitOperations.PopCount(
+				~state[(laneBlocks - 1) * LongLanes + lane] & TokenSort.LastBlockMask(l2));
+			var score = TokenSort.ScoreFromLcs(l1, l2, zeros);
+			if (score > b) scores[grp.OriginalIndex[lane]] = score;
+		}
+	}
+
 	[ThreadStatic] static Worker? _worker;
 
 	static Worker GetWorker() => _worker ??= new Worker();
 
-	/// <summary>Per-thread scratch buffers; content never outlives one FindBestCore call.</summary>
+	/// <summary>Per-thread scratch buffers; content never outlives one FindBestCore or ScoreAll call.</summary>
 	sealed class Worker
 	{
 		readonly Normalizer _normalizer = new();
