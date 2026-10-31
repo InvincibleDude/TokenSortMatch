@@ -34,7 +34,7 @@ string norm = TokenSort.Normalize("The-Quick! Brown?? fox"); // "brown fox quick
 var index = new TokenSortIndex(["Лекционные занятия", "Практические занятия", "Экзамен"]);
 
 BestMatch? best = index.FindBest("занятия лекционные 5", threshold: 80);
-// -> BestMatch(ItemIndex: 0, Score: 87)
+// -> BestMatch(ItemIndex: 0, Score: 95)
 
 int[] scores = index.FindBestScores(queries, threshold: 80);      // parallel, -1 if below
 BestMatch?[] all = index.FindBestMatches(queries, threshold: 80); // parallel, null if below
